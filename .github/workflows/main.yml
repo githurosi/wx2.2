@@ -1,14 +1,13 @@
-name: Auto Update Worker with Assets and Changelog
+name: Auto Update Worker with Assets
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   schedule:
     - cron: "0 1 * * *" # 每天凌晨1点运行
   workflow_dispatch:
     inputs:
       force_update:
-        description: '是否强制更新（忽略版本检查）'
+        description: '是否强制更新'
         required: false
         default: 'false'
 
@@ -19,120 +18,65 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出当前仓库
+      - name: 检出仓库
         uses: actions/checkout@v4
+
+      - name: 创建资产目录
+        run: mkdir -p 源码未混淆
+
+      - name: 获取最新版本信息
+        id: release
+        uses: actions/github-script@v6
         with:
-          fetch-depth: 0 # 拉取完整历史记录，用于版本对比
+          script: |
+            const response = await github.rest.repos.getLatestRelease({
+              owner: "bia-pain-bache",
+              repo: "BPB-Worker-Panel"
+            });
+            return {
+              tag_name: response.data.tag_name,
+              download_url: response.data.assets[0].browser_download_url,
+              body: response.data.body
+            };
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 清理可能干扰的环境变量
+      - name: 检查更新
         run: |
-          unset TAG_NAME
-          unset DOWNLOAD_URL
-          unset CHANGELOG
-
-      - name: 设置环境变量
-        run: |
-          RELEASES_URL="https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases"
-          RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$RELEASES_URL")
-          if [ $? -ne 0 ]; then
-            echo "无法访问GitHub API，错误码 $?"
-            exit 1
-          fi
-          STATUS_CODE=$(echo "$RESPONSE" | jq -r '.status')
-          if [ "$STATUS_CODE" -ge 400 ]; then
-            echo "API响应错误，状态码: $STATUS_CODE"
-            exit 1
-          fi
-          export TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
-          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name | endswith(".zip")) | .browser_download_url')
-          export CHANGELOG=$(echo "$RESPONSE" | jq -r '.[0].body' | sed 's/[^\x00-\x7F]//g; s/\\//g; s/\"//g')
-
-      - name: 检查本地版本
-        run: |
-          LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "0.0.0")
-
-      - name: 判断是否需要更新
-        run: |
-          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
-          SHOULD_UPDATE=true
-          if [ "$FORCE_UPDATE" = "true" ]; then
-            echo "需要更新（强制更新）"
+          LOCAL_TAG=$(cat version.txt 2>/dev/null)
+          FORCE=${{ github.event.inputs.force_update }}
+          if [ "$FORCE" = "true" ] || [ "$LOCAL_TAG" != "${{ steps.release.outputs.tag_name }}" ]; then
+            echo "需要更新: ${{ steps.release.outputs.tag_name }}"
+            echo "UPDATE=true" >> $GITHUB_OUTPUT
           else
-            if [ "$LOCAL_VERSION" != "$TAG_NAME" ]; then
-              echo "需要更新（版本不同）"
-            else
-              echo "已是最新版本，无需更新"
-              SHOULD_UPDATE=false
-            fi
-          fi
-          if [ "$SHOULD_UPDATE" = "false" ]; then
-            exit 0
+            echo "已是最新版本"
           fi
         id: need_update
 
-      - name: 创建资产存放目录
-        if: steps.need_update.outcome == 'success'
+      - name: 下载资产到指定目录
+        if: steps.need_update.outputs.UPDATE == 'true'
         run: |
-          mkdir -p 源码未混淆 # 创建根目录下的“源码未混淆”文件夹
+          URL=${{ steps.release.outputs.download_url }}
+          TAG=${{ steps.release.outputs.tag_name }}
+          wget -qO 源码未混淆/${TAG}.zip $URL
+          echo "✅ 下载完成: 源码未混淆/${TAG}.zip"
 
-      - name: 下载最新资产文件到指定目录
-        if: steps.need_update.outcome == 'success'
+      - name: 同步日志到主页
+        if: steps.need_update.outputs.UPDATE == 'true'
         run: |
-          MAX_RETRIES=3
-          RETRY_COUNT=0
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            if [ -z "$DOWNLOAD_URL" ]; then
-              echo "下载链接为空，无法下载"
-              exit 1
-            fi
-            # 下载到“源码未混淆”目录并命名为最新版本号.zip
-            wget -q -O 源码未混淆/${TAG_NAME}.zip $DOWNLOAD_URL
-            if [ $? -eq 0 ]; then
-              break
-            fi
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            sleep 2
-          done
-          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-            echo "资产文件下载失败，已达到最大重试次数"
-            exit 1
-          fi
-          echo "✅ 已下载资产到源码未混淆目录: ${TAG_NAME}.zip"
-
-      - name: 处理主页内容（可选：如需解压资产请取消注释）
-        # if: steps.need_update.outcome == 'success'
-        # run: |
-        #   unzip -o 源码未混淆/${TAG_NAME}.zip -d 源码未混淆/
-        #   rm 源码未混淆/${TAG_NAME}.zip
-        #   echo "✅ 已解压资产到源码未混淆目录"
-
-      - name: 整合主页日志
-        if: steps.need_update.outcome == 'success'
-        run: |
-          RELEASE_CONTENT=$(cat RELEASE.md 2>/dev/null || echo "")
-          CURRENT_LOG_CONTENT=$(cat homepage_log.txt 2>/dev/null || echo "")
-          COMBINED_CONTENT="$RELEASE_CONTENT\n\n## 📦 最新资产更新\n版本: $TAG_NAME\n资产文件: ${TAG_NAME}.zip\n\n$CURRENT_LOG_CONTENT"
-          echo -e "$COMBINED_CONTENT" > README.md
-
-      - name: 保存更新日志
-        if: steps.need_update.outcome == 'success'
-        run: |
-          echo "${CHANGELOG}" | tee -a -i - encoding=utf-8 changelog.txt >/dev/null
+          LOG=$(echo -e "## 📦 资产更新\n版本: ${{ steps.release.outputs.tag_name }}\n日志: ${{ steps.release.outputs.body }}")
+          echo -e "$LOG\n\n$(cat README.md 2>/dev/null)" > README.md
 
       - name: 更新版本号
-        if: steps.need_update.outcome == 'success'
-        run: |
-          echo "$TAG_NAME" > version.txt
+        if: steps.need_update.outputs.UPDATE == 'true'
+        run: echo ${{ steps.release.outputs.tag_name }} > version.txt
 
-      - name: 提交更新
-        if: steps.need_update.outcome == 'success'
-        uses: stefanzweifel/git-auto-commit-action@v4
+      - name: 提交变更
+        if: steps.need_update.outputs.UPDATE == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔄 同步 ${TAG_NAME} 资产到源码未混淆目录"
-          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
-          branch: main
+          commit_message: 🔄 更新资产到源码未混淆目录
           files: |
             源码未混淆/
             README.md
             version.txt
-            changelog.txt
