@@ -1,13 +1,13 @@
-name: Auto Update Worker with Assets
+name: 同步资产与更新日志（未混淆版）
 on:
   push:
     branches: [ main ]
   schedule:
-    - cron: "0 1 * * *" # 每天凌晨1点运行
+    - cron: "0 1 * * *" # UTC+8凌晨1点
   workflow_dispatch:
     inputs:
       force_update:
-        description: '是否强制更新'
+        description: '是否强制更新（忽略版本检查）'
         required: false
         default: 'false'
 
@@ -15,68 +15,77 @@ permissions:
   contents: write
 
 jobs:
-  update:
+  sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
-
-      - name: 创建资产目录
-        run: mkdir -p 源码未混淆
-
-      - name: 获取最新版本信息
-        id: release
-        uses: actions/github-script@v6
         with:
-          script: |
-            const response = await github.rest.repos.getLatestRelease({
-              owner: "bia-pain-bache",
-              repo: "BPB-Worker-Panel"
-            });
-            return {
-              tag_name: response.data.tag_name,
-              download_url: response.data.assets[0].browser_download_url,
-              body: response.data.body
-            };
+          fetch-depth: 1 # 浅克隆加速
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget jq translate-shell unzip
+
+      - name: 创建资产目录（未混淆）
+        run: mkdir -p 未混淆 # 创建指定名称文件夹
+
+      - name: 下载最新资产到未混淆目录
+        id: download-assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 检查更新
         run: |
-          LOCAL_TAG=$(cat version.txt 2>/dev/null)
-          FORCE=${{ github.event.inputs.force_update }}
-          if [ "$FORCE" = "true" ] || [ "$LOCAL_TAG" != "${{ steps.release.outputs.tag_name }}" ]; then
-            echo "需要更新: ${{ steps.release.outputs.tag_name }}"
-            echo "UPDATE=true" >> $GITHUB_OUTPUT
-          else
-            echo "已是最新版本"
+          set -euo pipefail
+          REPO_OWNER="bia-pain-bache"          # 目标仓库所有者
+          REPO_NAME="BPB-Worker-Panel"         # 目标仓库名
+          response=$(curl -s https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest)
+          TAG_NAME=$(echo "$response" | jq -r '.tag_name')
+          ASSETS=($(echo "$response" | jq -r '.assets[].name'))
+
+          for asset in "${ASSETS[@]}"; do
+            DOWNLOAD_URL=$(echo "$response" | jq -r ".assets[] | select(.name == \"$asset\") | .browser_download_url")
+            wget -q --show-progress "$DOWNLOAD_URL" -O "未混淆/$asset" # 路径指定为未混淆/
+            echo "已下载资产到未混淆目录: $asset"
+          done
+
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "ASSETS=$(echo ${ASSETS[*]})" >> $GITHUB_OUTPUT
+
+      - name: 同步更新日志
+        id: update-log
+        run: |
+          set -euo pipefail
+          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
+          LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
+          REPO_OWNER="bia-pain-bache"
+          REPO_NAME="BPB-Worker-Panel"
+
+          response=$(curl -s https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest)
+          TAG_NAME=$(echo "$response" | jq -r '.tag_name')
+          RELEASE_NOTES=$(echo "$response" | jq -r '.body')
+
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
+            echo "✅ 已是最新版本（$TAG_NAME），无需更新"
+            exit 0
           fi
-        id: need_update
 
-      - name: 下载资产到指定目录
-        if: steps.need_update.outputs.UPDATE == 'true'
-        run: |
-          URL=${{ steps.release.outputs.download_url }}
-          TAG=${{ steps.release.outputs.tag_name }}
-          wget -qO 源码未混淆/${TAG}.zip $URL
-          echo "✅ 下载完成: 源码未混淆/${TAG}.zip"
+          # 翻译日志（可选）
+          TRANSLATED_NOTES=$(echo "$RELEASE_NOTES" | trans -b -e google -t zh-CN || echo "$RELEASE_NOTES")
 
-      - name: 同步日志到主页
-        if: steps.need_update.outputs.UPDATE == 'true'
-        run: |
-          LOG=$(echo -e "## 📦 资产更新\n版本: ${{ steps.release.outputs.tag_name }}\n日志: ${{ steps.release.outputs.body }}")
-          echo -e "$LOG\n\n$(cat README.md 2>/dev/null)" > README.md
+          # 更新版本和日志
+          echo "$TAG_NAME" > version.txt
+          echo -e "## 📦 资产更新日志（未混淆目录）\n### $TAG_NAME\n资产文件: ${ASSETS[*]}\n\n$TRANSLATED_NOTES" >> README.md
 
-      - name: 更新版本号
-        if: steps.need_update.outputs.UPDATE == 'true'
-        run: echo ${{ steps.release.outputs.tag_name }} > version.txt
-
-      - name: 提交变更
-        if: steps.need_update.outputs.UPDATE == 'true'
+      - name: 提交所有文件
+        if: always()
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: 🔄 更新资产到源码未混淆目录
+          commit_message: |
+            🔄 同步 ${TAG_NAME} 资产到未混淆目录
+            资产: ${{ steps.download-assets.outputs.ASSETS }}
           files: |
-            源码未混淆/
-            README.md
-            version.txt
+            未混淆/        # 资产目录
+            version.txt    # 版本文件
+            README.md      # 主页日志
